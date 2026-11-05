@@ -6,7 +6,8 @@ fast-travel points, levels and towers are further checks.
 
 ## Goals
 
-- **Towers** (default): beat a number of tower bosses.
+- **Towers** (default): beat a number of tower bosses. Any towers count, but the logic plans for the first ones in the
+  game's order: Zoe (level 10), Lily (20), Axel (30), Marcus (40), Victor (50), Saya (55), Bjorn (60), Auri (68).
 - **Relic Hunt**: collect Palpagos Relics, shuffled across the whole multiworld.
 - **Paldeck**: register a number of different Pals (catch or hatch them).
 - **World Tree**: beat the boss at the top of the World Tree, the end of the game. Untested in game so far.
@@ -14,19 +15,24 @@ fast-travel points, levels and towers are further checks.
 ## How many checks
 
 Checks stop at a level that fits the goal (the Check Level Cap, automatic by default): 8 levels past the last tower
-you need, 5 levels past the level by which you can register enough Pals, 30 for a Relic Hunt, or no limit for the
+boss you need (18 for one tower, 28 for two), 5 levels past the level by which you can register enough Pals, 30 for a Relic Hunt, or no limit for the
 World Tree. Shop slots for techs above it stay normal research. Ready-made presets (approximate check counts; a typical Archipelago
 game has about 180):
 
 | Preset | Goal | Checks |
 |---|---|---|
-| Short Sync | 1 tower, level checks every 5 (5, 10, 15, 20), no fast-travel checks | ~205 |
-| Sync | 1 tower | ~265 |
-| Long Sync | 2 towers | ~540 |
-| Relic Hunt Sync | 15 of 20 relics, checks up to level 25 | ~340 |
+| Short Sync | 1 tower, level checks every 5 (5, 10, 15), no fast-travel checks | ~180 |
+| Sync | 1 tower | ~240 |
+| Long Sync | 2 towers | ~390 |
+| Relic Hunt Sync | 15 of 20 relics, checks up to level 25 | ~355 |
 | Paldeck Sync | 60 Pals | ~250 |
-| Async | 3 towers | ~730 |
+| Async | 3 towers | ~585 |
 | Full Game Async | World Tree | ~1,150 |
+
+With Area Locks on, a short goal keeps a small map: areas whose Pals are all above the cap have no pass and no checks,
+and their walls stay up (Areas Beyond the Goal: locked, the default). A two-tower game has passes for the areas up to
+level 28 only. Areas Beyond the Goal can instead open them from the start (still with no checks in them), or keep a
+pass for every area as before.
 
 Shop slots cost their usual tech points. Long goals ask for more points than levelling gives: Technical Manuals from
 dungeons, treasure chests and the Bounty shop make up the rest.
@@ -36,10 +42,26 @@ game.
 
 ## What the logic expects
 
-Levels climb area by area: an area counts for levelling once you can catch its Pals (spheres good enough for them,
-and the furnace their recipe needs) and are no more than 8 levels below them. Towers and alphas also need spheres for
-their level. Crossing the open sea needs a mount that swims or flies (its saddle and the Pal), and the Sky Islands a
-flying one.
+Levels climb area by area: an area counts for levelling once it is open and you are no more than 8 levels below its
+Pals. Nothing stops you levelling; the logic just won't expect a level-20 boss or a level-23 Pal before your open areas
+let you reach that level.
+
+By default (Gear Logic off) only Area Passes and levels decide where things can be. Your first Pal Sphere comes early,
+and gear never holds up progression: better spheres, furnaces, prerequisites, the Pal Labor Research Lab and breeding
+are ordinary items. Tech cards that need another tech or Lab research first stay normal research, bred-only Pals
+aren't checks, and parts of the map only the open sea reaches have no checks. A saddle counts only where the map needs
+one: a flying mount for the Sky Islands, and a swimming or flying one when the goal lies across the open sea.
+
+With Gear Logic on, the logic also asks for spheres good enough for each Pal's level (and the furnace their recipe
+needs), every tech's prerequisites, the Lab, breeding, and a mount for the open sea.
+
+Tech slots cost their usual tech points, which the logic doesn't count. So only the slots levelling pays for in time
+(6 points a level, the cheapest first as they open; Ancient slots within the Ancient points of the towers you beat before
+the goal) can hold anyone's progression or useful items; the rest hold filler and traps. Fast-travel points and
+Technical Manuals give the spare points for those.
+
+Filler items are material bundles (Wood, Stone, Paldium, Ingot, Sphere, Food); the Tech Point Items option adds
+Tech Points +2 and Ancient Tech Points +1.
 
 By default the décor techs (furniture, flag and foliage sets, statues, signs and lights) stay normal research, bought
 with tech points as usual; the Tech Checks option can make them checks too.
