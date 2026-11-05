@@ -7,6 +7,7 @@ local MAP = require("area_map")
 local SHAPES = require("area_shapes")
 
 local W = {}
+local P = require("perf")
 local function log(msg) print("[PalworldAP] " .. msg .. "\n") end
 local reported = {}
 local function once(key, msg) if not reported[key] then reported[key] = true; log(msg) end end
@@ -21,7 +22,14 @@ local PER_TICK = 30           -- pieces raised or taken down per update, to spre
 local SINK_STEPS = 60         -- an opened wall sinks into the ground over 60 steps of 33 ms (2 s), then goes
 
 local raised = {}             -- piece index -> wall actor
+local nRaised = 0             -- how many raised holds (counted as it changes: W.count ran every update)
 local cls, gs = nil, nil
+-- Each piece's direction, worked out once (lockedNear did it for every raised piece every 7th update).
+local trig = {}
+for i, w in ipairs(DATA.walls) do
+    local yaw = math.rad(w[4])
+    trig[i] = { math.cos(yaw), math.sin(yaw) }
+end
 
 local function isOpen(area, passes)
     return area == SEA or area == START or passes[area] == true
@@ -40,9 +48,14 @@ local function ready()
     return cls ~= nil and cls:IsValid() and gs ~= nil and gs:IsValid()
 end
 
--- A new world (another save, back from the title): its walls are gone with the old one; start over.
+-- A new world (another save, back from the title): its walls are gone with the old one; start over. Only walls that
+-- are really gone are forgotten: the core's world key is the pawn, which also changes (or reads nil for a moment) in
+-- the same world, and a wall forgotten while still standing could never be taken down.
 function W.reset()
-    raised = {}
+    for i, a in pairs(raised) do
+        local ok, valid = pcall(function() return a:IsValid() end)
+        if not (ok and valid) then raised[i], nRaised = nil, nRaised - 1 end
+    end
 end
 
 local function raise(i, context)
@@ -54,7 +67,9 @@ local function raise(i, context)
     local a = gs:BeginDeferredActorSpawnFromClass(context, cls, t, 1, nil)
     if not a or not a:IsValid() then return false end
     gs:FinishSpawningActor(a, t)
+    W.skinNew(a)
     raised[i] = a
+    nRaised = nRaised + 1
     return true
 end
 
@@ -94,20 +109,39 @@ if LoopAsync then
         return false
     end)
 end
+local function forget(i)
+    if raised[i] then raised[i], nRaised = nil, nRaised - 1 end
+end
 local function lower(i)
     local a = raised[i]
-    raised[i] = nil
+    forget(i)
     if not (a and a:IsValid()) then return end
     local w = DATA.walls[i]
     sinking[#sinking + 1] = { a, w[1], w[2], 0 }
 end
 
+-- Walls the game removed (back to the title, another world) are noticed by checking a share of the pieces each
+-- update, all of them every 14 updates (4 s): 6dd356e checked all 818 every update (an estimated 0.3-0.5 ms,
+-- unmeasured). A new world is noticed at once anyway: main.lua resets on a new pawn.
+local CHECK_PER_TICK = 60
+local checkAt = 0
+local function checkSome()
+    local n = #DATA.walls
+    for _ = 1, math.min(CHECK_PER_TICK, n) do
+        checkAt = checkAt % n + 1
+        local a = raised[checkAt]
+        if a and not a:IsValid() then forget(checkAt) end
+    end
+end
+function W.oldSweep()                 -- 6dd356e's check of every piece (only for the perf probe's Ctrl+0 replay)
+    for _, a in pairs(raised) do a:IsValid() end
+end
+
 -- Brings the walls in line with the passes held: raises missing pieces of locked borders, takes down pieces whose
 -- areas are both open (a few per call).
+local catchingUp = false              -- back to full after a Ctrl+7 test state: log when every piece is up again
 function W.update(enabled, passes, context)
-    for i, a in pairs(raised) do                      -- walls the game removed (back to the title, another world)
-        if not a:IsValid() then raised[i] = nil end
-    end
+    checkSome()
     if not ready() then return end
     local budget = PER_TICK
     for i, w in ipairs(DATA.walls) do
@@ -115,13 +149,42 @@ function W.update(enabled, passes, context)
         local up = enabled and not (isOpen(DATA.areas[w[5] + 1], passes) and isOpen(DATA.areas[w[6] + 1], passes))
         if up and not raised[i] then
             local ok, err = pcall(raise, i, context)
-            if not ok then log("could not raise wall " .. i .. ": " .. tostring(err)); return end
+            if not ok then
+                -- Once per kind of error: a raise that fails fails again on every update (three lines a second).
+                once("raise" .. tostring(err):gsub("0x%x+", ""):gsub("%d+", "#"), "could not raise wall " .. i .. ": " .. tostring(err))
+                return
+            end
             budget = budget - 1
         elseif not up and raised[i] then
             lower(i)
             budget = budget - 1
         end
     end
+    W.skinTick()
+    if catchingUp and budget == PER_TICK then
+        catchingUp = false
+        P.wallsCaughtUp(nRaised)
+    end
+end
+
+-- The perf probe's Ctrl+7 test states (test_tools=1 only): hidden (collision kept), nocoll (shown, no collision),
+-- none (every raised piece removed at once, no sinking), full (as normal; the update raises what is missing).
+-- While the state is not full, main.lua neither raises nor lowers pieces nor sends anyone home.
+function W.perfMode(mode)
+    if mode == "none" then
+        for _, a in pairs(raised) do
+            if a:IsValid() then pcall(function() a:K2_DestroyActor() end) end
+        end
+        raised, nRaised = {}, 0
+        return
+    end
+    for _, a in pairs(raised) do
+        if a:IsValid() then
+            pcall(function() a:SetActorHiddenInGame(mode == "hidden") end)
+            pcall(function() a:SetActorEnableCollision(mode ~= "nocoll") end)
+        end
+    end
+    if mode == "full" then catchingUp = true end
 end
 
 -- Which area a spot is in (nil off the main map: the World Tree's own map). The map's rows are decoded when first used.
@@ -176,10 +239,10 @@ function W.lockedNear(x, y, passes)
     local best, bestD = nil, NEAR
     for i, a in pairs(raised) do
         local w = DATA.walls[i]
-        local yaw = math.rad(w[4])
+        local cos, sin = trig[i][1], trig[i][2]
         local dx, dy = x - w[1], y - w[2]
-        local along = dx * math.cos(yaw) + dy * math.sin(yaw)
-        local across = -dx * math.sin(yaw) + dy * math.cos(yaw)
+        local along = dx * cos + dy * sin
+        local across = -dx * sin + dy * cos
         local over = math.max(0, math.abs(along) - w[3] / 2)
         local d = math.sqrt(over * over + across * across)
         if d < bestD then
@@ -211,9 +274,203 @@ local FADE = { R = 0.38, G = 0.40, B = 0.46, A = 1 }      -- the locked areas' t
 local WHITE = { R = 1, G = 1, B = 1, A = 1 }
 local EDGE_SHADE = 0.45      -- how dark the band is at the very edge (1: not at all)
 W.dir = "."
+-- The game instance lives all session (skill: GameInstance-owned objects); kept, and looked up again only if it is
+-- no longer valid. 6dd356e looked it up on every update while a map screen existed.
+local ownerGi = nil
 local function owner()
+    if ownerGi and ownerGi:IsValid() then return ownerGi end
     local gi = FindFirstOf("PalGameInstance") or FindFirstOf("GameInstance")
-    return gi and gi:IsValid() and gi or nil
+    ownerGi = gi and gi:IsValid() and gi or nil
+    return ownerGi
+end
+
+-- Wall skins (test builds: wall_skin=a, b, a3d or b3d in config.txt, or Ctrl+F3 with test_tools=1 to cycle them): the Art &
+-- Assets lane's patterns (walls/ap-wall-pattern-<skin>.png, 512x512, greyscale) in AP teal on our walls only. One
+-- dynamic copy of the walls' own material (MI_AirBlock_v2) per skin, owned by the game instance like the map's render
+-- targets, set on each piece's mesh; the game's own barriers keep the shared red material. The material's parameters
+-- (from the server pak): MainTexture01 is the pattern (T_DungeonGate02: linear, single channel); MainTexture02 is the
+-- engine's blue noise for the dither, left alone; Color, DayColor and NightColor are the tint (night = 0.42 of day);
+-- TilingU_01/TilingV_01 default to 5 and 3, ScrollingU_01/ScrollingV_01 to 0. Untested in game (2026-11-04).
+-- a3d/b3d: the same, shaded as if raised (v0.13.5 playtest: a and b looked flat). <skin>-dense: that pattern tiled 10x6,
+-- twice the material's 5x3, nearer the red grid's density (about 50 px a cell at 3 m against a3d's 100).
+-- colour-<x>: full-colour tiles (walls/ap-wall-colour-<x>.png, RGBA) on our own material, M_APWall, from the
+-- PalworldArchipelagoArt pak (logicmod/make_wall_material.py; the user, 2026-11-05: the game's material can show one
+-- colour per piece, they want multicolour). Without the pak (or the file) such a skin is refused, logged, and skipped
+-- by Ctrl+F3. colour-<x>-flow: that tile drifting sideways (FLOW tiles a second; the user's rainbow, 2026-11-05).
+local SKINS = { "red", "colour-rainbow", "colour-rainbow-flow", "colour-paws", "colour-routes", "colour-grid",
+                "a", "b", "a3d", "b3d", "a3d-dense", "b3d-dense" }
+local FLOW = 0.05
+local AP_WALL = "/Game/Mods/PalworldArchipelagoArt/M_APWall.M_APWall"
+local apWall = nil                                             -- M_APWall once loaded
+local DENSE = { 10, 6 }
+local TEAL = { R = 0.018, G = 0.745, B = 0.604, A = 1 }       -- sRGB #24E0CC, the user's pick
+local NIGHT = 0.421875                                         -- the game's NightColor over its DayColor
+local skin = { now = "red", want = "red", base = nil, mids = {}, failed = {} }
+W.tiling, W.scroll = nil, nil                                  -- { u, v } from config.txt, or the material's own
+local function meshOf(a)
+    local ok, m = pcall(function() return a.Cube end)
+    if ok and m and m:IsValid() then return m end
+    local smc = StaticFindObject("/Script/Engine.StaticMeshComponent")
+    ok, m = pcall(function() return a:GetComponentByClass(smc) end)
+    if ok and m and m:IsValid() then return m end
+end
+local function apWallMaterial()
+    if apWall and apWall:IsValid() then return apWall end
+    pcall(LoadAsset, AP_WALL)
+    local m = StaticFindObject(AP_WALL)
+    if m and m:IsValid() then apWall = m; W.keep(m); return m end
+end
+local function colourMaterial(name, gi, krl, kml)
+    local base = apWallMaterial()
+    if not base then log("wall skin " .. name .. ": needs the PalworldArchipelagoArt pak (M_APWall not found)"); return nil end
+    local flow = name:match("^(.-)%-flow$")
+    local path = W.dir .. "\\walls\\ap-wall-" .. (flow or name) .. ".png"
+    local tex = krl:ImportFileAsTexture2D(gi, path)
+    if not (tex and tex:IsValid()) then log("wall skin " .. name .. ": could not load " .. path); return nil end
+    W.keep(tex)                                                -- a colour picture: sRGB as imported
+    local mid = kml:CreateDynamicMaterialInstance(gi, base, FName("None"), 0)
+    if not (mid and mid:IsValid()) then log("wall skin " .. name .. ": could not make the material"); return nil end
+    W.keep(mid)
+    mid:SetTextureParameterValue(FName("Pattern"), tex)
+    local scroll = flow and { FLOW, 0 } or W.scroll
+    if scroll then
+        mid:SetScalarParameterValue(FName("ScrollU"), scroll[1])
+        mid:SetScalarParameterValue(FName("ScrollV"), scroll[2])
+    end
+    skin.mids[name], skin.failed[name] = mid, nil
+    log("wall skin " .. name .. ": material made on M_APWall" .. (scroll and (", scrolling " .. scroll[1] .. "," .. scroll[2]) or ""))
+    return mid
+end
+local function skinMaterial(name)
+    local mid = skin.mids[name]
+    if mid and mid:IsValid() then return mid end
+    if skin.failed[name] then return nil end
+    skin.failed[name] = true                                   -- one try per skin per session; cleared on success
+    local gi = owner()
+    local krl = StaticFindObject("/Script/Engine.Default__KismetRenderingLibrary")
+    local kml = StaticFindObject("/Script/Engine.Default__KismetMaterialLibrary")
+    if not (gi and skin.base and skin.base:IsValid() and krl and krl:IsValid() and kml and kml:IsValid()) then
+        log("wall skin " .. name .. ": no game instance, wall material or material library yet")
+        skin.failed[name] = nil
+        return nil
+    end
+    if name:find("^colour%-") then return colourMaterial(name, gi, krl, kml) end
+    local file = name:match("^(.-)%-dense$")
+    local tiling = file and DENSE or W.tiling
+    local path = W.dir .. "\\walls\\ap-wall-pattern-" .. (file or name) .. ".png"
+    local tex = krl:ImportFileAsTexture2D(gi, path)
+    if not (tex and tex:IsValid()) then log("wall skin " .. name .. ": could not load " .. path); return nil end
+    local srgb = pcall(function() tex.SRGB = false; tex:UpdateResource() end)   -- the game's pattern is linear
+    W.keep(tex)
+    mid = kml:CreateDynamicMaterialInstance(gi, skin.base, FName("None"), 0)
+    if not (mid and mid:IsValid()) then log("wall skin " .. name .. ": could not make the material"); return nil end
+    W.keep(mid)
+    mid:SetTextureParameterValue(FName("MainTexture01"), tex)
+    local night = { R = TEAL.R * NIGHT, G = TEAL.G * NIGHT, B = TEAL.B * NIGHT, A = 1 }
+    for k, c in pairs({ Color = TEAL, DayColor = TEAL, NightColor = night }) do mid:SetVectorParameterValue(FName(k), c) end
+    if tiling then
+        mid:SetScalarParameterValue(FName("TilingU_01"), tiling[1])
+        mid:SetScalarParameterValue(FName("TilingV_01"), tiling[2])
+    end
+    if W.scroll then
+        mid:SetScalarParameterValue(FName("ScrollingU_01"), W.scroll[1])
+        mid:SetScalarParameterValue(FName("ScrollingV_01"), W.scroll[2])
+    end
+    skin.mids[name], skin.failed[name] = mid, nil
+    -- Blueprint_GetSizeX/Y: Lua sees only UFunctions (v0.13.5 playtest: GetSurfaceWidth is C++ only, and the call errored).
+    local okw, size = pcall(function() return tex:Blueprint_GetSizeX() .. "x" .. tex:Blueprint_GetSizeY() end)
+    log("wall skin " .. name .. ": material made (" .. (okw and size or "size unknown")
+        .. (srgb and ", linear" or ", sRGB: could not change") .. ", tiling "
+        .. (tiling and (tiling[1] .. "x" .. tiling[2]) or "the material's") .. ")")
+    return mid
+end
+-- Puts the current skin on one piece (a new piece, or every raised one when the skin changes).
+local function dress(a, mid)
+    local m = meshOf(a)
+    if not m then return false end
+    if not skin.base then skin.base = m:GetMaterial(0); W.keep(skin.base) end   -- the red original, before any change
+    m:SetMaterial(0, mid or skin.base)
+    return true
+end
+function W.skinNew(a)
+    if skin.now ~= "red" then pcall(dress, a, skin.mids[skin.now]) end
+end
+-- Empty or unset: the teal hex lattice, a (the user, 2026-11-05: "stick with the hex layout"); wall_skin=red for the
+-- game's own red grid.
+W.DEFAULT_SKIN = "a"
+function W.setSkin(name)
+    if name == "" or name == nil then name = W.DEFAULT_SKIN end
+    for _, s in ipairs(SKINS) do if s == name then skin.want = name; return end end
+    log("wall skin " .. tostring(name) .. ": unknown (" .. table.concat(SKINS, ", ") .. ")")
+end
+-- The next skin, skipping any refused this session (no pak, no file): it would be refused again and the cycle would
+-- stop there.
+function W.cycleSkin()
+    for k, s in ipairs(SKINS) do
+        if s == skin.want then
+            for j = 1, #SKINS do
+                local nxt = SKINS[(k + j - 1) % #SKINS + 1]
+                if not skin.failed[nxt] then skin.want = nxt; return nxt end
+            end
+        end
+    end
+end
+-- On the game thread (from W.update): the skin wanted, once the wall material is known (from the first piece raised).
+function W.skinTick()
+    if skin.want == skin.now then return end
+    if not skin.base then
+        local _, a = next(raised)
+        if not a then return end
+        local m = meshOf(a)
+        skin.base = m and m:GetMaterial(0)
+        if not skin.base then return end
+        W.keep(skin.base)
+    end
+    local mid = nil
+    if skin.want ~= "red" then
+        mid = skinMaterial(skin.want)
+        if not mid then skin.want = skin.now; return end
+    end
+    local n, bad = 0, 0
+    for _, a in pairs(raised) do
+        if a:IsValid() then
+            local ok, done = pcall(dress, a, mid)
+            if ok and done then n = n + 1 else bad = bad + 1 end
+        end
+    end
+    skin.now = skin.want
+    log("wall skin " .. skin.now .. ": on " .. n .. " pieces" .. (bad > 0 and (", " .. bad .. " without a mesh") or ""))
+end
+
+-- The locked-area stamps (Art & Assets lane: art/ap-map-stamp-<area>.png per area, round 2; art/ap-map-stamp.png when
+-- an area has none), 256x256 tickets with a padlock, drawn on each locked area STAMP_PX across on the 4096 map, a whole
+-- stamp inside the area on its side nearest the starting area (area_centres.lua, from tools/area_centres.py). v0.13.5
+-- playtest: at each area's deepest point all 14 sat under the map's fog of war, which a locked area never clears.
+local ART = require("art")
+local CENTRES = require("area_centres")
+local STAMP_PX = 88
+local function slugOf(name) return (name:lower():gsub("[^%w]+", "-")) end
+W.slugOf = slugOf
+local function lockedList(passes)
+    local out = {}
+    for k, name in ipairs(DATA.areas) do
+        if not isOpen(name, passes) then out[#out + 1] = k - 1 end
+    end
+    return out
+end
+local function drawStamps(canvas, krl, gi, locked)
+    local n = 0
+    for _, k in ipairs(locked) do
+        local c, name = CENTRES[k], DATA.areas[k + 1]
+        local tex = c and name and (ART.texture("ap-map-stamp-" .. slugOf(name)) or ART.texture("ap-map-stamp"))
+        if tex then
+            local u, v = c[3] or c[1], c[4] or c[2]
+            canvas:K2_DrawTexture(tex, { X = u * RT_SIZE - STAMP_PX / 2, Y = v * RT_SIZE - STAMP_PX / 2 },
+                { X = STAMP_PX, Y = STAMP_PX }, { X = 0, Y = 0 }, { X = 1, Y = 1 }, WHITE, 2, 0, { X = 0.5, Y = 0.5 })
+            n = n + 1
+        end
+    end
+    once("stamps" .. n, "map: " .. n .. " locked-area stamp(s) drawn")
 end
 local function greyscaleMap(krl, tex)
     if greyTex and greyTex:IsValid() then return greyTex end
@@ -312,6 +569,8 @@ local function drawMap(ctx, passes)
             if #band > 0 then canvas:K2_DrawTriangle(grey or tex, band) end
         end
     end
+    local okS, errS = pcall(drawStamps, canvas, krl, gi, lockedList(passes))
+    if not okS then once("stamperr", "map: stamps failed: " .. tostring(errS)) end
     krl:EndDrawCanvasToRenderTarget(gi, contextOut.RenderTarget and contextOut or extra)
     return true
 end
@@ -320,11 +579,47 @@ end
 -- shadow; when it is ready it is loaded and drawn into the render target. The picture is the game's own art: it stays
 -- in the mod folder and is never shipped.
 local COLOUR_FILE = "map-colour-1.png"
-local composing, composedKey = nil, nil       -- the locked set being composed / last composed
+local composing, composedKey, failedKey = nil, nil, nil   -- the locked set being composed / last composed / last failed
+local composingList = {}                                  -- that set's area indexes (for the stamps)
+-- A fingerprint of the map the game shows: 16 pixels of it drawn small. A mod that replaces the map's art changes it, so
+-- the saved colour map is made again (once a session, cheaply, instead of exporting the whole map every time).
+local printChecked, printNow = false, nil
+local function mapPrint(krl, tex, gi)
+    local rt = krl:CreateRenderTarget2D(gi, 16, 16, 2, { R = 0, G = 0, B = 0, A = 1 }, false)
+    local canvasOut, contextOut, extra = {}, {}, {}
+    krl:BeginDrawCanvasToRenderTarget(gi, rt, canvasOut, contextOut, extra)
+    canvasOut.Canvas:K2_DrawTexture(tex, { X = 0, Y = 0 }, { X = 16, Y = 16 }, { X = 0, Y = 0 },
+        { X = 1, Y = 1 }, WHITE, 0, 0, { X = 0.5, Y = 0.5 })
+    krl:EndDrawCanvasToRenderTarget(gi, contextOut.RenderTarget and contextOut or extra)
+    local parts = {}
+    for i = 0, 15 do
+        local c = krl:ReadRenderTargetPixel(gi, rt, (i % 4) * 4 + 2, (i // 4) * 4 + 2)
+        parts[#parts + 1] = string.format("%d,%d,%d", c.R, c.G, c.B)
+    end
+    return table.concat(parts, ";")
+end
+local function readFile(path)
+    local f = io.open(path, "rb")
+    if not f then return nil end
+    local s = f:read("*a")
+    f:close()
+    return s
+end
 local function colourMap(krl, tex, gi)
     local path = W.dir .. "\\" .. COLOUR_FILE
+    if not printChecked then
+        printChecked = true
+        local ok, fp = pcall(mapPrint, krl, tex, gi)
+        if ok then printNow = fp else log("map: no fingerprint (" .. tostring(fp) .. "): keeping the saved colour map") end
+    end
+    local saved = readFile(path .. ".txt")
     local f = io.open(path, "rb")
-    if f then f:close(); return path end
+    if f then
+        f:close()
+        if not printNow or saved == printNow then return path end
+        if saved then log("map: the game's map picture changed (another mod?): saving it again")
+        else log("map: saving the colour map again with a fingerprint (made before map changes were checked)") end
+    end
     local rt = krl:CreateRenderTarget2D(gi, RT_SIZE, RT_SIZE, 2, { R = 0, G = 0, B = 0, A = 1 }, false)   -- RTF_RGBA8
     local canvasOut, contextOut, extra = {}, {}, {}
     krl:BeginDrawCanvasToRenderTarget(gi, rt, canvasOut, contextOut, extra)
@@ -332,6 +627,10 @@ local function colourMap(krl, tex, gi)
         { X = 1, Y = 1 }, WHITE, 0, 0, { X = 0.5, Y = 0.5 })
     krl:EndDrawCanvasToRenderTarget(gi, contextOut.RenderTarget and contextOut or extra)
     krl:ExportRenderTarget(gi, rt, W.dir, COLOUR_FILE)
+    if printNow then
+        local out = io.open(path .. ".txt", "wb")
+        if out then out:write(printNow); out:close() end
+    end
     log("map: saved the colour map " .. path)
     return path
 end
@@ -342,8 +641,13 @@ local function lockedIndexes(passes)
     end
     return table.concat(out, ",")
 end
--- Starts or finishes a composition; true once the render target holds the picture for this locked set.
+-- Starts or finishes a composition; true once the render target holds the picture for this locked set, "failed" once
+-- composing it failed.
 local function composeMap(ctx, passes, key)
+    if not composing then                    -- the usual case: nothing to do, nothing to look up
+        if composedKey == key then return true end
+        if failedKey == key then return "failed" end
+    end
     local krl = StaticFindObject("/Script/Engine.Default__KismetRenderingLibrary")
     local gi = owner()
     if not gi then return false end
@@ -352,9 +656,11 @@ local function composeMap(ctx, passes, key)
         if st == "busy" then return false end
         local done = composing
         composing = nil
-        if st ~= "done" then log("map: composing failed: " .. tostring(st)); composedKey = done; return false end
+        -- A failure is not a picture: the render target still holds the last one. That set is not composed again (no
+        -- retry loop); the map is drawn without the compositor instead.
+        if st ~= "done" then log("map: composing failed: " .. tostring(st) .. "; drawing it without the compositor"); failedKey = done; return false end
         local tex = krl:ImportFileAsTexture2D(gi, W.dir .. "\\map-composed.png")
-        if not tex or not tex:IsValid() then log("map: could not load the composed map"); composedKey = done; return false end
+        if not tex or not tex:IsValid() then log("map: could not load the composed map; drawing it without the compositor"); failedKey = done; return false end
         if not mapRT or not mapRT:IsValid() then
             mapRT = krl:CreateRenderTarget2D(gi, RT_SIZE, RT_SIZE, 3, { R = 0, G = 0, B = 0, A = 1 }, false)
             W.keep(mapRT)
@@ -363,22 +669,26 @@ local function composeMap(ctx, passes, key)
         krl:BeginDrawCanvasToRenderTarget(gi, mapRT, canvasOut, contextOut, extra)
         canvasOut.Canvas:K2_DrawTexture(tex, { X = 0, Y = 0 }, { X = RT_SIZE, Y = RT_SIZE }, { X = 0, Y = 0 },
             { X = 1, Y = 1 }, WHITE, 0, 0, { X = 0.5, Y = 0.5 })
+        local okS, errS = pcall(drawStamps, canvasOut.Canvas, krl, gi, composingList)
+        if not okS then once("stamperr", "map: stamps failed: " .. tostring(errS)) end
         krl:EndDrawCanvasToRenderTarget(gi, contextOut.RenderTarget and contextOut or extra)
         composedKey = done
         return done == key
     end
-    if composedKey == key then return true end
     pcall(LoadAsset, MAP_TEXTURE)
     local tex = StaticFindObject(MAP_TEXTURE)
     if not tex or not tex:IsValid() then return false end
     local colour = colourMap(krl, tex, gi)
     local err = AP_ComposeMap(colour, W.dir .. "\\area_labels.png", lockedIndexes(passes),
         W.dir .. "\\map-composed.png", "0.4545")
-    if err == "" then composing = key elseif err ~= "busy" then once("compose" .. err, "map: could not compose: " .. err) end
+    if err == "" then composing, composingList = key, lockedList(passes) elseif err ~= "busy" then once("compose" .. err, "map: could not compose: " .. err) end
     return false
 end
 
+local mapShownAt = 0           -- map screens with a map image found on the last update (for the perf probe's replay)
+function W.mapShown() return mapShownAt > 0 end
 function W.updateMap(enabled, passes, ctx)
+    mapShownAt = 0
     if not enabled then return end
     -- The game keeps a template of the map screen beside the real ones; only a real one has its map image. There may be
     -- more than one real one (different menus), and a map screen sets its own picture again when it opens, so every
@@ -388,6 +698,7 @@ function W.updateMap(enabled, passes, ctx)
         local ok, img = pcall(function() local i = b.Image_MapBody; return i:IsValid() and i or nil end)
         if b:IsValid() and ok and img then images[#images + 1] = img end
     end
+    mapShownAt = #images
     if #images == 0 then return end
     local locked = {}
     for _, name in ipairs(DATA.areas) do
@@ -395,21 +706,28 @@ function W.updateMap(enabled, passes, ctx)
     end
     local key = table.concat(locked, "|")
     local redrawn = false
-    if AP_ComposeMap and AP_ComposeStatus then
+    local compose = AP_ComposeMap and AP_ComposeStatus
+    if compose then
         local ok, ready = pcall(composeMap, ctx, passes, key)
         if not ok then once("composeerr" .. tostring(ready), "map error: " .. tostring(ready)); ready = false end
-        if ready and key ~= mapKey then
-            mapKey, redrawn = key, true
-            log("map: " .. #locked .. " locked area(s) greyed")
+        if ready == "failed" then
+            compose = false
+        else
+            if ready and key ~= mapKey then
+                mapKey, redrawn = key, true
+                log("map: " .. #locked .. " locked area(s) greyed")
+            end
+            if not mapKey or not mapRT then return end    -- nothing composed yet: the game's own map stays
         end
-        if not mapKey or not mapRT then return end    -- nothing composed yet: the game's own map stays
-    elseif key ~= mapKey then
+    end
+    if not compose and key ~= mapKey then
         local ok, done = pcall(drawMap, ctx, passes)
         if not ok then log("map overlay error: " .. tostring(done)); mapKey = key; return end
         if not done then return end
         mapKey, redrawn = key, true
         log("map: " .. #locked .. " locked area(s) greyed")
     end
+    if not mapRT or not mapRT:IsValid() then return end
     local want = tostring(mapRT:GetAddress())
     for _, image in ipairs(images) do
         local okr, shown = pcall(function()
@@ -432,9 +750,7 @@ function W.updateMap(enabled, passes, ctx)
 end
 
 function W.count()
-    local n = 0
-    for _ in pairs(raised) do n = n + 1 end
-    return n, #DATA.walls
+    return nRaised, #DATA.walls
 end
 
 return W
