@@ -65,7 +65,7 @@ inv.MyInventoryInfo = { CommonContainerId = { ID = { A = 5, B = 5, C = 5, D = 5 
 local record = {
     PalCaptureCount = FastArray({ { "ChickenPal", 2 }, { "SheepBall", 0 } }),
     PaldeckUnlockFlag = FastArray({ { "Blueplatypus", true } }),
-    TowerBossDefeatFlag = FastArray({ { "EPalBossType::GrassBoss", true } }),
+    TowerBossDefeatFlag = FastArray({ { "BOSS_BATTLE_NAME_GrassBoss", true } }),   -- the key as 1.0.5 writes it
     NormalBossDefeatFlag = FastArray({ { "yamijima_IceLand_pink_D_BOSS", true }, { "mystery_boss", true } }),
     FastTravelPointUnlockFlag = FastArray({ { "6E03F8464BAD9E458B843AA30BE1CC8F", true } }),
 }
@@ -228,7 +228,8 @@ local gameplay = { IsValid = function() return true end,
                        function a:K2_DestroyActor() self.gone = true; wallsUp[self] = nil; lastGone = self end
                        function a:SetActorEnableCollision(on) self.collision = on end
                        function a:SetActorHiddenInGame(on) self.hidden = on end
-                       function a:K2_SetActorLocation(loc) self.sankTo = loc.Z end
+                       function a:K2_SetActorLocation() error("K2_SetActorLocation: its FHitResult out-parameter crashed UE4SS (2026-11-05)") end
+                       function a:SetActorScale3D(sc) self.shrunkTo = sc.Z; assert(sc.X > 0 and sc.Y > 0, "only the height shrinks") end
                        return a
                    end,
                    FinishSpawningActor = function(_, a) wallsUp[a] = true end,
@@ -372,6 +373,7 @@ StaticConstructObject = function(cls)
                          SetBrushFromTexture = function(self, t) self.texture = t end,
                          SetFont = function(self, f) self.fontSize = f.Size end,
                          SetColorAndOpacity = function(self, c) self.colour = c end,
+                         SetRenderOpacity = function(self, o) self.opacity = o end, SetVisibility = function(self, v) self.vis = v end,
                          SetRenderTransformPivot = function(self, v) self.pivot = v end,
                          SetText = function(self, t) self.text = t.text; bannerTexts[#bannerTexts + 1] = t.text end })
     function box:AddChild(c)
@@ -502,7 +504,8 @@ expect(td.TechnologyPoint == 12, "Tech Points +2 applied: " .. td.TechnologyPoin
 expect(checks[D.levels[2]] and checks[D.levels[4]] and not checks[D.levels[5]], "levels 2-4 checked, not 5")
 expect(checks[D.captures.chickenpal] and not checks[D.captures.sheepball], "capture by count, not zero count")
 expect(checks[D.captures.blueplatypus], "capture by Paldeck flag (case-insensitive)")
-expect(checks[D.towers.GrassBoss], "tower checked")
+expect(checks[D.towers.GrassBoss] and not logged("tower record key not mapped"),
+       "tower checked from its 1.0.5 record key (BOSS_BATTLE_NAME_GrassBoss)")
 expect(goals == 1, "goal sent once")
 expect(checks[D.alpha_spawners.yamijima_iceland_pink_d_boss[1]], "alpha checked by spawner id")
 expect(checks[D.fast_travel.FTPoint101], "fast travel mapped from its instance id")
@@ -692,6 +695,8 @@ do  -- wall skins (wall_skin / Ctrl+F3): the AP walls get a teal copy of their m
     W.cycleSkin(); run(1)
     expect(a.Cube.mat.textures.MainTexture01.path == "ap-wall-pattern-b3d" and a.Cube.mat.scalars.TilingU_01 == 10, "then b3d tiled 10x6")
     W.cycleSkin(); run(1)
+    expect(logged("wall skin area: colours ") and a.Cube.mat ~= wallRed, "then the area colours")
+    W.cycleSkin(); run(1)
     expect(a.Cube.mat == wallRed and logged("wall skin red: on"), "and back to the game's red")
     W.setSkin("c")
     expect(logged("wall skin c: unknown"), "an unknown skin is refused")
@@ -811,8 +816,9 @@ end)()
 local saidBefore = #said
 keyBinds["key:H"]()
 expect(#said == saidBefore, "no offer pending, nothing asked")
-expect(lastGone and lastGone.collision == false and lastGone.sankTo and lastGone.sankTo < 50000 - 290000,
-       "an opened wall sinks out of sight, stops blocking on the way down, then goes: " .. tostring(lastGone and lastGone.sankTo))
+expect(lastGone and lastGone.collision == false and lastGone.shrunkTo and lastGone.shrunkTo < 1,
+       "an opened wall shrinks to nothing (no K2_SetActorLocation: its FHitResult crashed UE4SS), stops blocking on the way, then goes: "
+       .. tostring(lastGone and lastGone.shrunkTo))
 expect(wallCount() == expected(open) and wallCount() < expected({ ["Open sea"] = true, [WD.start] = true }),
        "an Area Pass takes its area's walls down: " .. wallCount())
 local sample = next(wallsUp)
@@ -831,6 +837,20 @@ do  -- v0.13.5 playtest: stamps at each area's deepest point sat under the fog o
     local at = stampAt["ap-map-stamp-sea-breeze-archipelago"]
     expect(at and c[3] and math.abs(at.X - (c[3] * 4096 - 44)) < 0.01 and math.abs(at.Y - (c[4] * 4096 - 44)) < 0.01
            and (c[3] ~= c[1] or c[4] ~= c[2]), "a locked area's stamp goes on its side nearest the start, not its middle")
+end
+do  -- 2026-11-06 run: the full 88 px stamp buried a small region (Small Settlement); a small one is drawn smaller
+    local W = require("walls")
+    expect(W.stampSize({ 0, 0, 0, 0 }) == 88 and W.stampSize({ 0, 0, 0, 0, 120 }) == 88,
+           "an area with room (or data without the field) keeps the full 88 px stamp")
+    expect(W.stampSize({ 0, 0, 0, 0, 30 }) == 60 and W.stampSize({ 0, 0, 0, 0, 9 }) == 28,
+           "a small region's stamp is about as wide as the region, but at least 28 px")
+    local small, tiny = 0, 0
+    for _, c in pairs(dofile(MOD .. "/Scripts/area_centres_regions.lua")) do
+        expect(c[5], "every region's centre carries its room")
+        if c[5] and W.stampSize(c) < 88 then small = small + 1 end
+        if c[5] and c[5] < 14 then tiny = tiny + 1 end
+    end
+    expect(small > 0 and tiny > 0, "the regions set has small regions that get a smaller stamp")
 end
 local lockedFirst = composeJobs[1].locked
 expect(select(2, lockedFirst:gsub(",", "")) == 12 and not lockedFirst:find("^1,") and not lockedFirst:find(",2,"),
@@ -1099,7 +1119,7 @@ escNoMain = false                                          -- the usual client f
 run(1)
 expect(#taskChildren == 3, "the HUD's mission list gets no button: " .. #taskChildren)
 local mailBtn = escChildren[4]
-expect(mailBtn and mailBtn.Text_Main and mailBtn.Text_Main.text == "Archipelago Mailbox (50)",
+expect(mailBtn and mailBtn.Text_Main and mailBtn.Text_Main.text == "Archipelago Mailbox (1)",
        "the Esc menu has a mailbox button in its own small style, with the count: " .. tostring(mailBtn and mailBtn.Text_Main and mailBtn.Text_Main.text))
 expect(mailBtn and mailBtn.MenuType == 0 and mailBtn.padding and mailBtn.padding.Top == 10, "spaced as the game's, and harmless if bound")
 expect(logged("the Esc menu is WBP_MenuESC_C"), "found the Esc menu by its buttons")
@@ -1117,7 +1137,7 @@ run(3)
 mailBtn = escChildren[4]
 local addLines = 0
 for _, l in ipairs(printed) do if l:find("Mailbox button added", 1, true) then addLines = addLines + 1 end end
-expect(mailBtn and mailBtn.Text_Main.text == "Archipelago Mailbox (50)" and addLines == 1, "a new Esc menu gets its button; logged once: " .. addLines)
+expect(mailBtn and mailBtn.Text_Main.text == "Archipelago Mailbox (1)" and addLines == 1, "a new Esc menu gets its button; logged once: " .. addLines)
 -- No LogicMod: the hidden chest. It is made on first use, 300 slots, with the chest template put back after.
 chests, chestTemplates = {}, { { SlotNum = 54, GetFullName = function()
     return "PalMapObjectItemChestParameterComponent /Game/Pal/Blueprint/MapObject/BuildObject/BP_BuildObject_ItemChest_04.BP_BuildObject_ItemChest_04_C:ItemChestParameter_GEN_VARIABLE" end } }
@@ -1487,8 +1507,8 @@ local emblemBox = barKids[2]                               -- the mailbox emblem
 expect(emblemBox and emblemBox.child and emblemBox.child.texture and emblemBox.child.texture.path == "ap-mailbox-emblem-64"
        and emblemBox.width == 24 and emblemBox.halign == 3 and emblemBox.padding and emblemBox.padding.Right == 236,
        "with the mailbox emblem just left of it, 24 high")
-expect(#barKids == 2 and invBox.width == 230 and invBox.height == 28 and invBtn and invBtn.Text_Main
-       and invBtn.Text_Main.text == "Archipelago Mailbox (5)",
+expect(#barKids == 3 and invBox.width == 230 and invBox.height == 28 and invBtn and invBtn.Text_Main
+       and invBtn.Text_Main.text == "Archipelago Mailbox (1)",
        "the name bar gets the game's button, 230x28, with the count: " .. tostring(invBtn and invBtn.Text_Main and invBtn.Text_Main.text))
 expect(invBox and invBox.halign == 3 and invBox.valign == 0, "at the bar's right end, as tall as the Edit Name row")
 expect(linesWith("the inventory page is WBP_InventoryEquipment_C (via the main menu's CurrentContentWidget, tab 8)") == 1,
@@ -1497,7 +1517,9 @@ expect(logged("Mailbox button added to the inventory page %(WBP_CommonButton_C%)
        "logged where it went, once")
 expect(hooks[COMMON_CLICK], "its click is hooked")
 run(4)
-expect(#barKids == 2, "added once")
+expect(#barKids == 3, "added once (the mailbox button, its emblem, the crate button)")
+expect(barKids[3] and barKids[3].vis == 1 and barKids[3].padding and barKids[3].padding.Right == 268,
+       "the crate button waits, collapsed, left of the emblem until there is a crate")
 -- Focus probes: which of the bar's buttons a player reached, and with what input.
 inputSubsystems = { named("CommonInputSubsystem_0", "CommonInputSubsystem", { GetCurrentInputType = function() return 1 end }) }
 editName.WBP_PalInvisibleButton.focused = true
@@ -1517,8 +1539,28 @@ local page2, barKids2 = inventoryPage()
 mainMenu.CurrentContentWidget = inventoryTab(page2)
 run(1)
 local invBtn2 = barKids2[1] and barKids2[1].child
-expect(#barKids2 == 2 and #barKids == 2 and invBtn2 and invBtn2.Text_Main.text == "Archipelago Mailbox (5)"
+expect(#barKids2 == 3 and #barKids == 3 and invBtn2 and invBtn2.Text_Main.text == "Archipelago Mailbox (1)"
        and linesWith("Mailbox button added to the inventory page") == 1, "a new page gets its button, quietly; the old one none again")
+-- Palworld Crates: with a crate waiting, the page's Open button shows it, and a click opens it on the next update.
+;(function()   -- (a function: the main chunk is at Lua's 200-local limit)
+    local CR, MB = require("crates"), require("mailbox")
+    local saved, mailSaved = CR.list, {}
+    for _, e in ipairs(MB.queue) do mailSaved[#mailSaved + 1] = { id = e.id, n = e.n } end
+    CR.list = { "sphere" }
+    run(1)
+    local crateBox = barKids2[3]
+    local crateBtn = crateBox and crateBox.child
+    expect(crateBox and crateBox.vis == 0 and crateBtn and crateBtn.Text_Main and crateBtn.Text_Main.text == "Open: Sphere Crate",
+           "the Inventory page shows Open with the next crate: " .. tostring(crateBtn and crateBtn.Text_Main and crateBtn.Text_Main.text))
+    if crateBtn then commonClick(crateBtn) end
+    expect(#CR.list == 1, "nothing opens inside the click's hook")
+    run(1)
+    expect(#CR.list == 0 and logged("crate: opened a Sphere Crate at level %d+: %d+ x ") and table.concat(announced, "|"):find("Opened a Sphere Crate: ", 1, true),
+           "the next update opens it into the mailbox and says what was inside")
+    run(1)
+    expect(crateBox and crateBox.vis == 1, "with no crate left the button folds away")
+    CR.list, MB.queue = saved, mailSaved               -- as it was, for the tests below
+end)()
 commonClick(invBtn)                                        -- the old page's button: no longer ours
 run(1)
 expect(not mainMenu.closed, "a button on a page the menu let go of does nothing")
@@ -1539,7 +1581,7 @@ mainMenu = MainMenu(escMenu, 7)
 escOpen = true
 run(1)
 mailBtn = escChildren[4]
-expect(mailBtn and mailBtn.Text_Main.text == "Archipelago Mailbox (5)" and linesWith("Mailbox button added to the inventory page") == 1,
+expect(mailBtn and mailBtn.Text_Main.text == "Archipelago Mailbox (1)" and linesWith("Mailbox button added to the inventory page") == 1,
        "the Esc menu still gets its button; the Options tab no inventory one")
 shownBefore = #shown
 hooks[ESC_CLICK]({ get = function() return mailBtn end })
@@ -1655,14 +1697,13 @@ expect(t and movement:GetWalkSpeedMultiplier() == 0.5, "a Slow Trap halves walki
 expect(told("Slow Trap from Friend: your legs feel heavy (1 minute).") and not told("Received Slow Trap"),
        "chat names the trap and its sender, with no 'Received' line")
 expect(saveText():find("given=9\nworld=AP_WORLD\ndeaths=0\ntraps=\n", 1, true), "applied: the save has it given and nothing waiting: " .. saveText())
--- Two at once: 15 s apart.
+-- Two at once: both fire together (2026-11-05: not staggered).
 trap("Hunger Trap", "Friend")
 trap("Fool Trap", "Friend")
 local h = ticksUntil("trap #10 Hunger Trap from Friend", 100)
-expect(h and h >= 50 and h <= 57, "the next trap waits 15 s: " .. tostring(h) .. " ticks")
+expect(h and h <= 8, "a trap fires as it arrives: " .. tostring(h) .. " ticks")
 expect(stomach.cur == 30 and logged("satiety 80%.0 of 100%.0, set to 30%.0, reads back 30"), "a Hunger Trap takes half the satiety: " .. stomach.cur)
-local f = ticksUntil("trap #11 Fool Trap from Friend: fake notice", 100)
-expect(f and f >= 50, "and the one after it 15 s later again: " .. tostring(f))
+expect(logged("trap #11 Fool Trap from Friend: fake notice"), "and the one that came with it fires on the same update")
 local fake
 for _, a in ipairs(announced) do if a:find("broke free and ran off!", 1, true) then fake = a end end
 expect(fake and not fake:find("Archipelago", 1, true), "a Fool Trap shows a plain-looking scare: " .. tostring(fake))
@@ -1744,17 +1785,20 @@ ticksUntil("trap #21 Slow Trap", 80)
 pawnAddress = 12288
 expect(ticksUntil("Slow Trap ended; the player character changed, nothing to restore", 220), "a new character is left alone")
 movement.mult = {}
--- Queued when the game quits: it is in the save file, and fires once after loading.
+-- Queued when the game quits: it is in the save file, and fires once after loading. (A Teleport Trap waiting in a
+-- dungeon is the one left waiting; the Fool Trap beside it fires at once.)
+inStage = true
 trap("Fool Trap", "Friend")
-trap("Hunger Trap", "Friend")
+trap("Teleport Trap", "Friend")
 ticksUntil("trap #22 Fool Trap", 80)
 run(7)
-expect(saveText():find("traps=Hunger Trap|23\n", 1, true), "a waiting trap is in the save file: " .. saveText():match("traps=[^\n]*"))
+expect(saveText():find("traps=Teleport Trap|23\n", 1, true), "a waiting trap is in the save file: " .. saveText():match("traps=[^\n]*"))
+inStage = false
 reload()
 expect(logged("1 trap%(s%) waiting"), "loaded with the save")
-expect(ticksUntil("trap #23 Hunger Trap from Friend", 80), "and it fires after loading, with its sender")
+expect(ticksUntil("trap #23 Teleport Trap from Friend", 80), "and it fires after loading, with its sender")
 run(200)
-expect(count("trap #23 ") == 1 and count("trap #22 ") == 1, "each trap fired once")
+expect(count("trap #23 Teleport Trap from") == 1 and count("trap #22 Fool Trap from") == 1, "each trap fired once")
 -- A reconnect sends every item again: no trap fires twice.
 local fired = count("^%[PalworldAP%] trap #")
 push("status", "disconnected")
@@ -1767,8 +1811,10 @@ for _ = 1, 12 do trap("Fool Trap", "Friend") end
 run(7)
 expect(told("2 trap(s) skipped: at most 10 wait at a time.") and logged("trap #24 Fool Trap dropped") and logged("trap #25 Fool Trap dropped"),
        "more than 10 traps at once: the oldest extras are skipped")
-run(700)
-expect(count("trap #3[0-5] Fool Trap from Friend: fake") == 6 and not logged("trap #2[45] Fool Trap from"), "the other ten fire")
+run(14)
+expect(count("trap #3[0-5] Fool Trap from Friend: fake") == 6 and not logged("trap #2[45] Fool Trap from"), "the other ten fire at once")
+run(40)
+expect(count("Just kidding%. Fool Trap from Friend%.") >= 10, "each Fool Trap gets its own punchline")
 -- The connection drops while a Slow Trap and a Fool Trap run: both still end on time.
 trap("Slow Trap", "Friend")
 expect(ticksUntil("trap #36 Slow Trap from Friend: player multiplier", 80), "(a Slow Trap fires)")
@@ -2044,6 +2090,15 @@ local towerList = record.TowerBossDefeatFlag.Items.list
 towerList[#towerList + 1] = { Key = FNameOf("EPalBossType::WorldTreeBoss"), Value = true }
 run(14)
 expect(goals == before + 1 and logged("Goal complete: the World Tree's boss beaten!"), "World Tree: its boss wins")
+-- 2026-11-05 run: a two-tower seed, both towers beaten, keys as 1.0.5 writes them; the goal never went out.
+newSeed("70009", { ["options.goal"] = "0", ["options.tower_count"] = "2" })
+before = goals
+run(14)
+expect(goals == before, "two towers: one beaten is not the goal")
+towerList[#towerList + 1] = { Key = FNameOf("BOSS_BATTLE_NAME_ForestBoss"), Value = true }
+run(14)
+expect(goals == before + 1 and logged("Goal complete: 2 tower%(s%) beaten!") and checks[D.towers.ForestBoss],
+       "two towers: the second (BOSS_BATTLE_NAME_ForestBoss) is counted, checked, and wins")
 print("mailbox off: bundles straight to the bag")
 local MB = require("mailbox")
 local mailOn = MB.on
@@ -2357,6 +2412,8 @@ do  -- area_size regions: every named region of the game its own, opened by a Re
     push("item", "9000", tostring(itemId["Region Pass: Golden Hills"]), "1", "1", "1", "Region Pass: Golden Hills", "Tester")
     run(60)
     expect(wallCount() < up, "a Region Pass takes its region's walls down: " .. up .. " -> " .. wallCount())
+    expect(W.parentOf("Golden Hills") == "Bamboo Groves" and W.parentOf("Gobfin's Turf") == "Crescent Moon Shore",
+           "a region wears its area's colour, ticket and stamp (area_parents_regions.lua)")
     slotData["options.area_size"] = nil                          -- an areas seed again (and seeds made before the option)
     push("status", "disconnected")
     push("status", "connected", "Tester")
@@ -2387,6 +2444,265 @@ do  -- Areas beyond the goal (slot data beyond_goal_areas and options.beyond_goa
            "open: its walls come down without a pass: " .. up .. " -> " .. wallCount())
     slotData.beyond_goal_areas, slotData["options.beyond_goal"] = nil, nil
 end
+;(function()  -- area-coloured walls, sealed walls beyond the goal, the hint pop-up (v0.14.0-dev.3)
+    local W = require("walls")
+    local openedBeyond = hintArea                -- the open-beyond test above opened it
+    local hudKids = {}
+    local canvas = Widget({ GetClass = function() return classed("CanvasPanel") end, GetFName = function() return FNameOf("CanvasPanel_179") end })
+    function canvas:AddChildToCanvas(w)
+        hudKids[#hudKids + 1] = w
+        w.RemoveFromParent = function(self) self.removed = true end
+        local slot = { SetAnchors = function(sl, v) sl.anchors = v end, SetAlignment = function(sl, v) sl.alignment = v end,
+                       SetPosition = function(sl, v) sl.position = v end, SetAutoSize = function() end,
+                       SetZOrder = function(sl, z) sl.z = z end }
+        w.canvasSlot = slot
+        return slot
+    end
+    -- As on the client (v0.13.9 playtest): SafeZone_0 holding CanvasPanel_179.
+    local safe = Widget({ GetClass = function() return classed("SafeZone") end, GetChildAt = function() return canvas end })
+    local layout = Widget({ IsVisible = function() return true end, WidgetTree = { RootWidget = safe } })
+    local savedFAO = FindAllOf
+    FindAllOf = function(class) if class == "WBP_PalHUDLayout_C" then return { layout } end return savedFAO(class) end
+    local function actorOf(w)
+        for a in pairs(wallsUp) do if a.t.Translation.X == w[1] and a.t.Translation.Y == w[2] then return a end end
+    end
+    local function pieceBetween(x, y)
+        for _, w in ipairs(WD.walls) do
+            local a1, a2 = WD.areas[w[5] + 1], WD.areas[w[6] + 1]
+            if (a1 == x and a2 == y) or (a1 == y and a2 == x) then
+                local a = actorOf(w)
+                if a then return a end
+            end
+        end
+    end
+    local function close(c, d) return c and d and math.abs(c.R - d.R) < 1e-3 and math.abs(c.G - d.G) < 1e-3 and math.abs(c.B - d.B) < 1e-3 end
+    local function popupAfter(n)
+        for _ = 1, 450 do
+            if #hudKids > n then return hudKids[n + 1] end
+            run(1)
+        end
+    end
+    W.setSkin(nil); run(3)
+    -- An area beside the start still locked (the open-beyond test above opened the hint test's area), and a spot on
+    -- the start's side of one of its walls.
+    local area, at, piece
+    for _, w in ipairs(WD.walls) do
+        local x, y = WD.areas[w[5] + 1], WD.areas[w[6] + 1]
+        local other = (x == WD.start and y) or (y == WD.start and x)
+        if other and W.AREA_COLOURS[other] and w[3] > 5000 and actorOf(w) then
+            local yaw = math.rad(w[4])
+            for _, side in ipairs({ 1, -1 }) do
+                local px, py = w[1] - side * math.sin(yaw) * 1500, w[2] + side * math.cos(yaw) * 1500
+                if WALLS.areaAt(px, py) == WD.start then area, at, piece = other, { X = px, Y = py, Z = 0 }, actorOf(w) end
+            end
+            if area then break end
+        end
+    end
+    local hintArea, hintAt = area, at
+    local want = hintArea and W.linearOf(W.AREA_COLOURS[hintArea])
+    expect(piece and piece.Cube.mat.textures.MainTexture01.path == "ap-wall-pattern-pawholes" and close(piece.Cube.mat.vectors.Color, want)
+           and logged("wall skin area: colours "), "by default a wall wears the paw holes in the colour of the area it keeps you out of")
+    -- The hint pop-up at that wall: centred, a little transparent, gone after 6 s.
+    pawnAt = hintAt
+    local box = popupAfter(#hudKids)
+    local over = box and box.child
+    expect(box and box.width == 380 and box.height == 84 and box.opacity == 0.8 and box.vis == 4
+           and box.canvasSlot.anchors.Minimum.X == 0.5 and box.canvasSlot.anchors.Minimum.Y == 0.5
+           and box.canvasSlot.alignment.X == 0.5 and box.canvasSlot.position.Y == 0,
+           "walking up to a wall shows the hint pop-up in the middle of the screen at 0.8 opacity")
+    expect(over and over.children[1].child.texture.path == "ap-hint-plate-short" and over.children[2].text == hintArea .. " is sealed"
+           and over.children[3].text == "Not enough points for a hint: 3 of 121" and over.children[4] and over.children[4].width == 9,
+           "on the not-enough-points plate, with its two lines and the bar: "
+           .. tostring(over and over.children[3] and over.children[3].text))
+    run(21)
+    expect(box and box.removed, "and goes away after 6 s")
+    -- Beyond the goal: the sealed walls (slate grey; the sealed pattern when its file is found) and the pop-up says so.
+    slotData.beyond_goal_areas, slotData["options.beyond_goal"] = hintArea, "0"
+    push("status", "disconnected")
+    push("status", "connected", "Tester")
+    run(80)
+    local m = piece.Cube.mat
+    expect(m and (m.textures.MainTexture01.path == "ap-wall-pattern-sealed" or m.textures.MainTexture01.path == "ap-wall-pattern-a")
+           and close(m.vectors.Color, { R = 0.3231, G = 0.3663, B = 0.4564 }), "a wall to an area beyond the goal wears the sealed grey")
+    local sealedBox = popupAfter(#hudKids)
+    expect(sealedBox and sealedBox.child.children[2].text == hintArea .. " is beyond the goal"
+           and sealedBox.child.children[3].text == "Its walls stay up for good." and not sealedBox.child.children[4],
+           "its pop-up says it is beyond the goal, with no points bar")
+    slotData.beyond_goal_areas, slotData["options.beyond_goal"] = nil, nil
+    push("status", "disconnected")
+    push("status", "connected", "Tester")
+    run(80)
+    expect(close(piece.Cube.mat.vectors.Color, want), "and back to its area's colour when it is not")
+    -- A pass that opens one side of a piece still up turns it to the other side's colour.
+    local a1, a2, between
+    for _, w in ipairs(WD.walls) do
+        local x, y = WD.areas[w[5] + 1], WD.areas[w[6] + 1]
+        if W.AREA_COLOURS[x] and W.AREA_COLOURS[y] and not open[x] and not open[y] and x ~= openedBeyond
+           and y ~= openedBeyond and actorOf(w) then
+            a1, a2, between = x, y, actorOf(w)
+            break
+        end
+    end
+    local colourOf = function(area) return W.linearOf(W.AREA_COLOURS[area]) end
+    local before = between and between.Cube.mat.vectors.Color
+    push("item", "9300", tostring(itemId["Area Pass: " .. tostring(a1)]), "1", "1", "1", "Area Pass: " .. tostring(a1), "Tester")
+    run(80)
+    expect(between and (close(before, colourOf(a1)) or close(before, colourOf(a2))) and close(between.Cube.mat.vectors.Color, colourOf(a2))
+           and not between.gone, "a piece between " .. tostring(a1) .. " and " .. tostring(a2) .. " turns to "
+           .. tostring(a2) .. "'s colour when " .. tostring(a1) .. " opens")
+    FindAllOf = savedFAO
+end)()
+; (function()  -- debuff icons with their timers at the top of the HUD (the user, 2026-11-05)
+    local hudKids = {}
+    local canvas = Widget({ GetClass = function() return classed("CanvasPanel") end })
+    function canvas:AddChildToCanvas(w)
+        hudKids[#hudKids + 1] = w
+        w.RemoveFromParent = function(self) self.removed = true end
+        local slot = { SetAnchors = function(sl, v) sl.anchors = v end, SetAlignment = function(sl, v) sl.alignment = v end,
+                       SetPosition = function(sl, v) sl.position = v end, SetAutoSize = function() end, SetZOrder = function() end }
+        w.canvasSlot = slot
+        return slot
+    end
+    local safe = Widget({ GetClass = function() return classed("SafeZone") end, GetChildAt = function() return canvas end })
+    local layout = Widget({ IsVisible = function() return true end, WidgetTree = { RootWidget = safe } })
+    local savedFAO = FindAllOf
+    FindAllOf = function(class) if class == "WBP_PalHUDLayout_C" then return { layout } end return savedFAO(class) end
+    local DB = require("debuffs")
+    expect(DB.clock(200, 0) == "1:00" and DB.clock(100, 0) == "0:30" and DB.clock(5, 10) == "0:00", "the timer reads m:ss")
+    require("traps").test("Slow Trap")                     -- the test tools route: it goes on the next update
+    local row
+    for _ = 1, 40 do
+        for _, k in ipairs(hudKids) do if not k.removed then row = k end end
+        if row then break end
+        run(1)
+    end
+    local over = row and row.child
+    local timer = over and over.children[#over.children].child          -- the timer is the last piece of a tile
+    expect(row and row.canvasSlot.anchors.Minimum.X == 0.5 and row.canvasSlot.anchors.Minimum.Y == 0
+           and row.canvasSlot.position.Y == 112 and row.vis == 4,
+           "a Slow Trap puts its icon at the top centre of the HUD, never taking a click")
+    -- (The harness's ImportFileAsTexture2D makes any file; in game a missing ap-debuff-slow.png gives a plain SLOW tile.)
+    local icon = over and over.children[1].child
+    expect(icon and icon.texture and icon.texture.path == "ap-debuff-slow" and icon.ownerW == nil and over.children[1].width == 44,
+           "the Art lane's ap-debuff-slow icon, 44 px")
+    local first = timer and timer.text
+    expect(first == "1:00" or first == "0:59", "with its time left under it: " .. tostring(first))
+    run(10)
+    expect(timer.text ~= first and #hudKids == 1, "the timer counts down without rebuilding the row: " .. tostring(timer.text))
+    local ended = false
+    for _ = 1, 220 do
+        run(1)
+        if logged("Slow Trap ended") and row.removed then ended = true; break end
+    end
+    expect(ended and #DB.active() == 0,
+           "and the icon goes when the Slow Trap ends")
+    FindAllOf = savedFAO
+end)()
+;(function()  -- Palworld Crates (v0.14.0-dev.4): rolled on arrival, the same every time
+    local CR = require("crates")
+    slotData.seed = "70200"                     -- a seed of its own (as newSeed in the goals tests)
+    push("status", "connected", "Other")
+    run(14)
+    local before = CR.count()
+    push("item", "0", tostring(itemId["Palworld Crate"]), "1", "1", "1", "Palworld Crate", "Friend")
+    run(20)
+    expect(CR.count() == before + 1 and table.concat(announced, "|"):find("Palworld Crate: it's a ", 1, true),
+           "a Palworld Crate arrives as one of the five crates, and says which")
+    expect(CR.kindFor("seed", 5, CR.DEFAULT_WEIGHTS) == CR.kindFor("seed", 5, CR.DEFAULT_WEIGHTS), "the same seed and index roll the same crate")
+    local n = {}
+    for i = 1, 10000 do local k = CR.kindFor("seed", i, CR.DEFAULT_WEIGHTS); n[k] = (n[k] or 0) + 1 end
+    expect(math.abs(n.sphere - 3000) < 300 and math.abs(n.food - 2500) < 300 and math.abs(n.rare - 1200) < 200
+           and math.abs(n.jackpot - 300) < 120, string.format("over 10,000 the chances hold: %d %d %d %d %d",
+           n.sphere, n.food, n.common, n.rare, n.jackpot))
+    expect(CR.kindFor("x", 1, { sphere = 0, food = 0, common = 0, rare = 0, jackpot = 5 }) == "jackpot", "the slot's weights are used")
+    local ok = true
+    for _, kind in ipairs(CR.KINDS) do
+        for _, lv in ipairs({ 1, 20, 50 }) do
+            CR.list = { kind }
+            local k, out = CR.openNext(lv)
+            if k ~= kind or #out == 0 or not out[1].id or out[1].n < 1 then ok = false; print("  bad roll", kind, lv) end
+        end
+    end
+    expect(ok, "every crate kind rolls real contents at levels 1, 20 and 50")
+end)()
+;(function()  -- the Palworld Crates window over the mailbox's chest window (v0.14.0-dev.5)
+    local CR, MB, CW = require("crates"), require("mailbox"), require("crate_window")
+    local kids = {}
+    local canvas = Widget({ GetClass = function() return classed("CanvasPanel") end })
+    function canvas:AddChildToCanvas(w)
+        kids[#kids + 1] = w
+        w.RemoveFromParent = function(self) self.removed = true end
+        local slot = { SetAnchors = function(sl, v) sl.anchors = v end, SetAlignment = function(sl, v) sl.alignment = v end,
+                       SetPosition = function(sl, v) sl.position = v end, SetAutoSize = function() end, SetZOrder = function() end }
+        w.canvasSlot = slot
+        return slot
+    end
+    local chestWin = Widget({ WidgetTree = { RootWidget = canvas } })
+    local savedCW, savedList = MB.chestWidget, CR.list
+    MB.chestWidget = function() return chestWin end
+    CR.list = { "rare", "sphere", "rare", "jackpot" }
+    run(1)
+    local panel = kids[#kids]
+    local over = panel and panel.child
+    local function texts(o)
+        local t = {}
+        for _, c in ipairs(o and o.children or {}) do
+            if c.text then t[#t + 1] = c.text end
+            if c.child and c.child.text then t[#t + 1] = c.child.text end
+        end
+        return table.concat(t, "|")
+    end
+    local all = texts(over)
+    expect(panel and panel.width == 800 and panel.height == 500 and panel.canvasSlot.anchors.Minimum.X == 0.5
+           and logged("crate window: shown over the mailbox %(4 crate%(s%)%)"),
+           "with crates waiting, the mailbox shows the crate window, 800x500, centred")
+    expect(over and over.children[1].child and over.children[1].child.texture and over.children[1].child.texture.path == "ap-mailbox-window",
+           "on the Art lane's window plate")
+    expect(all:find("Sphere Crate|1 waiting", 1, true) and all:find("Rare Supply Crate|2 waiting", 1, true)
+           and all:find("Jackpot Supply Crate|1 waiting", 1, true) and not all:find("Food Crate", 1, true),
+           "one row per kind waiting, with its count: " .. all)
+    -- The rows' Open buttons: find the Rare row's and click it.
+    local clickHook
+    for k, f in pairs(hooks) do if k:find("WBP_CommonButton_C:BndEvt", 1, true) then clickHook = f end end
+    local rareOpen
+    for _, c in ipairs(over.children) do
+        local b = c.child
+        if b and b.Text_Main and b.Text_Main.text == "Open" and not rareOpen then
+            -- rows follow the kinds' order: sphere first, then rare
+        end
+    end
+    local opens = {}
+    for _, c in ipairs(over.children) do if c.child and c.child.Text_Main and c.child.Text_Main.text == "Open" then opens[#opens + 1] = c.child end end
+    rareOpen = opens[2]
+    expect(#opens == 3 and clickHook, "each row has the game's button to open one: " .. #opens)
+    clickHook({ get = function() return rareOpen end })
+    expect(#CR.list == 4, "nothing opens inside the click's hook")
+    run(1)
+    run(1)
+    local n = 0
+    for _, k in ipairs(CR.list) do if k == "rare" then n = n + 1 end end
+    expect(#CR.list == 3 and n == 1 and logged("crate: opened a Rare Supply Crate"), "the row's Open opens one of its kind")
+    local panel2 = kids[#kids]
+    local all2 = texts(panel2 and panel2.child)
+    expect(panel ~= panel2 and panel.removed and all2:find("Last opened: Rare Supply Crate", 1, true),
+           "the window is rebuilt with the contents of the crate just opened: " .. all2)
+    -- Close: the small button brings it back.
+    local closeBtn
+    for _, c in ipairs(panel2.child.children) do if c.child and c.child.Text_Main and c.child.Text_Main.text == "X" then closeBtn = c.child end end
+    clickHook({ get = function() return closeBtn end })
+    run(2)
+    local toggle = kids[#kids]
+    expect(panel2.removed and toggle and toggle.child and toggle.child.Text_Main and toggle.child.Text_Main.text == "Open Palworld Crates (3)",
+           "Close leaves the chest with an Open Palworld Crates (3) button")
+    expect(not toggle.slot or not toggle.slot.anchors or (toggle.slot.anchors.Minimum.X == 0.5 and toggle.slot.anchors.Minimum.Y == 0),
+           "at the top centre, where the player sees it (not the screen's corner)")
+    clickHook({ get = function() return toggle.child end })
+    run(2)
+    expect(toggle.removed and kids[#kids].width == 800, "which brings the window back")
+    MB.chestWidget, CR.list = savedCW, savedList
+    run(1)
+    expect(kids[#kids].removed, "and it all goes with the chest window")
+end)()
 expect(#badLoads == 0, "every LoadAsset path is a full /Game/Dir/Asset.Asset: " .. table.concat(badLoads, ", "))
 expect(not logged("but the bag gained"), "the bag gained what the game said it took")
 print(failures == 0 and "all passed" or (failures .. " failed"))

@@ -7,7 +7,7 @@
 --  * Checks: shop slots, levels, captures, alphas, fast-travel points and towers, read from the game's own records.
 -- Everything is logged to ue4ss/UE4SS.log with the prefix [PalworldAP].
 local function log(msg) print("[PalworldAP] " .. msg .. "\n") end
-local VERSION = "0.14.0-dev.2"
+local VERSION = "0.14.0-dev.11"
 log("loaded " .. VERSION)
 
 local modDir = (debug.getinfo(1, "S").source:gsub("^@", ""):gsub("[/\\]Scripts[/\\]main%.lua$", ""))
@@ -17,6 +17,10 @@ local TECHS = require("tech_icons")
 local ICONS, STRUCTURES = TECHS.icons, TECHS.structures
 local R = require("records")
 local WALLS = require("walls")
+local POPUP = require("hint_popup")
+local DEBUFFS = require("debuffs")
+local CRATES = require("crates")
+local CWIN = require("crate_window")
 local MENU = require("menu")
 local TECHSCAN = require("techscan")
 local MAIL = require("mailbox")
@@ -172,10 +176,10 @@ local function loadSave()
         if n then ap.given = tonumber(n)
         elseif w then ap.world = w
         elseif d then ap.forgiven = tonumber(d)
-        elseif not TRAPS.load(line) then MAIL.load(line) end
+        elseif not TRAPS.load(line) and not CRATES.load(line) then MAIL.load(line) end
     end
     local kinds, items = MAIL.count()
-    log("save " .. path .. ": items applied up to index " .. ap.given .. "; mailbox " .. items .. " item(s) of " .. kinds
+    log("save " .. path .. ": items applied up to index " .. ap.given .. "; " .. CRATES.count() .. " crate(s); mailbox " .. items .. " item(s) of " .. kinds
         .. " kind(s); " .. #TRAPS.queue .. " trap(s) waiting; " .. ap.forgiven .. " faint(s) forgiven; world " .. tostring(ap.world))
 end
 -- Written only when its text changed (it was rewritten every 7th update, 2.1 s, even when nothing had changed: an
@@ -188,7 +192,7 @@ local function writeSave(always)
     if not path then return end
     -- One write holds everything that must agree: what was applied, and the traps and mailbox items it left.
     local text = "given=" .. ap.given .. "\n" .. (ap.world and ("world=" .. ap.world .. "\n") or "")
-        .. "deaths=" .. ap.forgiven .. "\n" .. TRAPS.serialize() .. MAIL.serialize() .. "end\n"
+        .. "deaths=" .. ap.forgiven .. "\n" .. TRAPS.serialize() .. MAIL.serialize() .. CRATES.serialize() .. "end\n"
     if not always and lastSave == path .. "\n" .. text then return end
     P.start("save")
     local f = io.open(path .. ".tmp", "w")
@@ -348,9 +352,16 @@ end
 
 -- One-off effects of items, in index order; each is applied once per seed. False when it could not be applied yet (a
 -- bundle the bag refused, with the mailbox off): it is tried again later.
-local function giveOneOff(ps, id)
+local function giveOneOff(ps, id, index)
     local it = D.items[id]
     if not it then return true end
+    if it.name == "Palworld Crate" then
+        local weights = {}
+        for _, k in ipairs(CRATES.KINDS) do weights[k] = tonumber(AP_SlotData("options." .. CRATES.WEIGHT_KEYS[k])) end
+        local kind = CRATES.receive(ap.seed, index, weights)
+        notify("Palworld Crate: it's a " .. CRATES.NAMES[kind] .. "! Open it from the Inventory page when you like.")
+        return true
+    end
     local td = ps:GetTechnologyData()
     if it.name == "Tech Points +2" then
         td.TechnologyPoint = td.TechnologyPoint + 2
@@ -385,12 +396,57 @@ local function relicCount(upto)
 end
 
 local waiting = nil           -- the index of a bundle the bag had no room for (mailbox off): given once there is room
+
+-- Gear and accessories from a crate go straight to the bag (the mailbox chest can't hold per-item data); what the
+-- bag refused is tried again here, every applying update.
+local function givePending()
+    while CRATES.pending[1] do
+        local e = CRATES.pending[1]
+        local okg, got = pcall(MAIL.give, e[1], e[2])
+        got = okg and got or 0
+        if got <= 0 then return end
+        e[2] = e[2] - got
+        if e[2] <= 0 then table.remove(CRATES.pending, 1) end
+        notify("Your bag had room: " .. MAIL.nameOf(e[1]) .. " from a crate is in it now.")
+    end
+end
+
+-- Opening a crate (the Inventory page's Open button: the next one; the crate window's: one of `kind`), its contents
+-- rolled from the player's level now. Returns the kind and the contents.
+local function openCrate(kind)
+    local ps = playerState()
+    if not (ps and ps:IsValid()) then notify("Open crates in your world."); return end
+    local lv = R.level(ps) or ap.level or 1
+    local out
+    kind, out = CRATES.openNext(lv, kind)
+    if not kind then return end
+    local parts = {}
+    for _, r in ipairs(out) do
+        local name = MAIL.nameOf(r.id)
+        if r.bag or not MAIL.on() then
+            local okg, got = pcall(MAIL.give, r.id, r.n)
+            got = okg and got or 0
+            if got < r.n then CRATES.pending[#CRATES.pending + 1] = { r.id, r.n - got } end
+            parts[#parts + 1] = (r.n > 1 and (r.n .. " x ") or "") .. name .. (got < r.n and " (waits for room in your bag)" or " (in your bag)")
+        else
+            MAIL.add(r.id, r.n)
+            parts[#parts + 1] = r.n .. " x " .. name
+        end
+    end
+    log("crate: opened a " .. CRATES.NAMES[kind] .. " at level " .. lv .. ": " .. table.concat(parts, ", ")
+        .. "; " .. CRATES.count() .. " left")
+    notify("Opened a " .. CRATES.NAMES[kind] .. ": " .. table.concat(parts, ", ") .. ".")
+    writeSave()
+    return kind, out
+end
+
 local function applyItems(ps)
+    givePending()
     local i = ap.given + 1
     while ap.items[i] do
         local id = ap.items[i]
         local it = D.items[id]
-        if it and it.kind == "filler" and not giveOneOff(ps, id) then
+        if it and it.kind == "filler" and not giveOneOff(ps, id, i) then
             if waiting ~= i then
                 waiting = i
                 notify("Your bag is full: " .. it.name .. " waits until there is room.")
@@ -600,10 +656,13 @@ local function relabel(card, key, full)
     local clickable = not sent or mine ~= nil
     local it = own and D.items[r.id]
     local kind = (it and it.kind == "pass") and "area-pass" or (r and iconKind(r.flags) or "filler")
-    -- An Area Pass shows its own area's ticket (art/ap-pass-<area>.png, round 2), else the shared one; a Region Pass
-    -- (area_size regions) the shared one.
+    -- An Area Pass shows its own area's ticket (art/ap-pass-<area>.png, round 2); a Region Pass (area_size regions) its
+    -- area's, else the Region Pass ticket (ap-pass-region.png); else the shared one.
+    local ART = require("art")
     local tex = mine and techIcon(mine)
-        or (kind == "area-pass" and it.name:find("^Area Pass") and require("art").texture("ap-pass-" .. WALLS.slugOf(it.area)))
+        or (it and it.name == "Palworld Crate" and ART.texture("ap-crate-palworld"))
+        or (kind == "area-pass" and (ART.texture("ap-pass-" .. WALLS.slugOf(WALLS.parentOf(it.area)))
+                                     or (it.name:find("^Region Pass") and ART.texture("ap-pass-region"))))
         or icon(kind, card)
     local texAddr = tex and safe(function() return tostring(tex:GetAddress()) end) or nil
     local sig = name .. "\0" .. category .. "\0" .. tostring(clickable) .. "\0" .. tostring(texAddr)
@@ -814,7 +873,13 @@ local function unlockableCheck(self, ...)
     if not tech or not shopCard(tech) then return nil end
     local r = slotUnlockable(self:get(), tech)
     if r ~= nil and not reported.unlockable then once("unlockable", "slot clickability decided by the mod (first: " .. tech .. " -> " .. tostring(r) .. ")") end
-    if tech == hoveredTech and not reported["ask1" .. tech] then once("ask1" .. tech, "click check on " .. tech .. ": unlockable -> " .. tostring(r)) end
+    if tech == hoveredTech and not reported["ask1" .. tech] then
+        -- Left to the game (nil): its own answer too, the first plain boolean UE4SS hands the after-callback (2026-11-05:
+        -- Direhowl's Saddled Harness stayed greyed with no gate in our data or the game's table).
+        local game
+        if r == nil then for i = 1, select("#", ...) do if type((select(i, ...))) == "boolean" then game = select(i, ...); break end end end
+        once("ask1" .. tech, "click check on " .. tech .. ": unlockable -> " .. tostring(r) .. (r == nil and (" (the game says " .. tostring(game) .. ")") or ""))
+    end
     return r
 end
 local oku, erru = pcall(RegisterHook, "/Script/Pal.PalTechnologyData:IsUnlockableRecipeTechnology", function() end,
@@ -897,6 +962,7 @@ local techScan = { report = nil, tries = 0, sent = false }   -- other mods' tech
 
 local function resetSeed()
     ap.checked, ap.sent, ap.scouted, ap.items, ap.techs, ap.passes = {}, {}, {}, {}, {}, {}
+    CRATES.reset()
     ap.given, ap.goalSent, ap.ready, ap.shown = -1, false, false, false     -- items are numbered from 0
     ap.world, seedWorld = nil, nil
     ap.from, ap.forgiven = {}, 0
@@ -945,6 +1011,7 @@ local function onEvent(line)
             local mode = AP_SlotData("options.beyond_goal")
             ap.beyondOpen = mode == "2" or mode == "open"
             if ap.beyondOpen then for area in pairs(ap.beyond) do ap.passes[area] = true end end
+            WALLS.setBeyond(ap.beyondOpen and {} or ap.beyond)    -- sealed walls and stamps (open ones come down)
             if nBeyond > 0 then
                 log("areas beyond the goal: " .. nBeyond .. (ap.beyondOpen and ", open from the start" or ", sealed for good"))
             end
@@ -1017,9 +1084,18 @@ MENU.install({
         notify("Disconnected from Archipelago.")
     end,
     mailboxLabel = MAIL.label,
+    crateLabel = CRATES.label,
+    openCrate = function() local ok, err = pcall(openCrate); if not ok then log("crate error: " .. tostring(err)) end end,
+    crateWindow = function(action) local ok, err = pcall(CWIN.action, action); if not ok then log("crate window error: " .. tostring(err)) end end,
     openMailbox = function(context) MAIL.open(context) end,
 })
 MAIL.install({ notify = notify, save = writeSave, cfg = cfg, connected = function() return ap.status == "connected" end })
+CWIN.install({ chestWidget = function() return MAIL.chestWidget() end, nameOf = function(id) return MAIL.nameOf(id) end, claim = MENU.claim, unclaim = MENU.unclaim,
+               openCrate = function(kind)
+                   local ok, k, out = pcall(openCrate, kind)
+                   if not ok then log("crate error: " .. tostring(k)); return nil end
+                   return k, out
+               end })
 TRAPS.install({ notify = notify, save = writeSave,
                 announce = function(text) log(text); R.notify(text, playerState()) end,
                 sender = function(index) return ap.from[index] end,
@@ -1032,20 +1108,33 @@ else
 end
 
 -- Hints for Area Passes, bought with the server's hint points (!hint), offered at the walls.
+-- Returns the chat line, and what the hint pop-up shows (hint_popup.lua: two short lines and the points bar).
 local function wallNotice(area)
-    if ap.beyond and ap.beyond[area] then return area .. " is beyond this seed's goal: its walls stay up." end
+    if ap.beyond and ap.beyond[area] then
+        return area .. " is beyond this seed's goal: its walls stay up.",
+            { title = area .. " is beyond the goal", line = "Its walls stay up for good." }
+    end
     local pass = WALLS.passName(area)
-    if hints.known[area] then return area .. " is sealed. " .. hints.known[area] end
+    if hints.known[area] then
+        local where, world = hints.known[area]:match(" is at (.-) in (.-)'s World")
+        return area .. " is sealed. " .. hints.known[area],
+            { title = area .. " is sealed", line = where and ("Its pass is at " .. where .. " (" .. world .. ")")
+                                                     or hints.known[area]:sub(1, 60), ready = true }
+    end
     local text = "The way into " .. area .. " is sealed: it needs " .. pass .. "."
     local points, cost = (AP_HintPoints and AP_HintPoints() or ""):match("^(%d+),(%d+)$")
-    if not points then return text end
+    if not points then return text, { title = area .. " is sealed", line = "It needs " .. pass .. "." } end
     points, cost = tonumber(points), tonumber(cost)
     hints.offer, hints.offeredAt = area, tick
     -- Both cases say what the player has and what a hint costs (the user, 2026-11-04), with the configured key.
     if points >= cost then
-        return text .. " Press " .. hints.key .. " for a hint: you have " .. points .. " points, a hint costs " .. cost .. "."
+        return text .. " Press " .. hints.key .. " for a hint: you have " .. points .. " points, a hint costs " .. cost .. ".",
+            { title = area .. " is sealed", line = hints.key .. " for a hint: " .. points .. " points, a hint costs " .. cost,
+              have = points, cost = cost, ready = true }
     end
-    return text .. " Not enough points for a hint: you have " .. points .. " points, a hint costs " .. cost .. "."
+    return text .. " Not enough points for a hint: you have " .. points .. " points, a hint costs " .. cost .. ".",
+        { title = area .. " is sealed", line = "Not enough points for a hint: " .. points .. " of " .. cost,
+          have = points, cost = cost, ready = false }
 end
 local function askHint()
     local area = hints.offer
@@ -1161,6 +1250,9 @@ end
 
 local function update(ctx)
     tick = tick + 1
+    pcall(POPUP.tick, tick)
+    local okdb, errdb = pcall(DEBUFFS.tick, tick)
+    if not okdb then once("debuffs" .. tostring(errdb), "debuffs error: " .. tostring(errdb)) end
     P.start("poll")
     for line in AP_Poll():gmatch("[^\n]+") do
         local ok, err = pcall(onEvent, line)
@@ -1174,6 +1266,8 @@ local function update(ctx)
     if not okm then onceErr("menu", errm, "menu error: " .. tostring(errm)) end
     P.start("mail")
     local okx, errx = pcall(MAIL.update, ctx)
+    local okw, errw = pcall(CWIN.update)
+    if not okw then once("cwin" .. tostring(errw), "crate window error: " .. tostring(errw)) end
     P.stop("mail")
     if not okx then onceErr("mail", errx, "mailbox error: " .. tostring(errx)) end
     -- The first batch of items arrives just after the connection; wait a moment before locking anything.
@@ -1244,7 +1338,10 @@ local function update(ctx)
                 end)
                 if okn and area and (hints.shown[area] or -1e9) + 400 <= tick then
                     hints.shown[area] = tick
-                    notify(wallNotice(area))
+                    local line, info = wallNotice(area)
+                    notify(line)
+                    local okp, errp = pcall(POPUP.show, info, tick)
+                    if not okp then log("hint pop-up error: " .. tostring(errp)) end
                 end
             end
             -- A player inside a locked area (loaded there, or past a wall) goes back to the starting area. Not while
